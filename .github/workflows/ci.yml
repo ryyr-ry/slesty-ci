@@ -1,21 +1,33 @@
 # Public CI for the PRIVATE Slesty repository.
 #
 # SECURITY MODEL (do not change without review):
-# - This repository holds NO source code. The private repo
-#   ryyr-ry/Slesty is cloned AT RUNTIME using a READ-ONLY SSH deploy key
-#   stored in the SLESTY_DEPLOY_KEY secret. The key is scoped to that one
-#   repository, read-only, and can never push, never read any other
-#   repository, and never expires silently (rotate from Slesty's
-#   Settings > Deploy keys if needed).
-# - The key is never echoed or committed; GitHub masks secrets in logs.
-# - No file from the private repository is ever uploaded to THIS
-#   repository; only compiled binaries and test logs are published as
-#   artifacts/releases.
 #
-# CRLF GUARD: secrets piped from Windows can carry \r\n, which breaks
-# ssh key parsing on the runners ("error in libcrypto"). The normalize
-# step below strips CR before the key is used, so the secret round-trips
-# from any OS.
+# THE NON-NEGOTIABLE RULE: nothing derived from the private repository is
+# EVER stored in this public repository - not as a release, not as an
+# artifact, not as a cache, not for a second. GitHub makes public-repo
+# artifacts and releases downloadable by ANYONE with the URL, so even a
+# "temporary" upload is a leak.
+#
+# Therefore:
+# - Public runners CLONE the private source with a read-only deploy key.
+# - They build and test it.
+# - Each OS job then pushes its finished binary DIRECTLY into the PRIVATE
+#   repository's releases using a write-scoped release token - from the
+#   job itself, via `gh release create --repo ryyr-ry/Slesty`. The bytes
+#   go runner -> GitHub's private storage. They never transit through
+#   anything public on the way in.
+# - This repository keeps NO artifacts, NO releases, NO caches. The only
+#   public footprint is the run log (secret-masked, no source inside).
+#
+# KEYS (both stored as encrypted secrets in THIS repo):
+# - SLESTY_DEPLOY_KEY   : read-only SSH deploy key on ryyr-ry/Slesty.
+# - SLESTY_RELEASE_TOKEN: fine-grained PAT with contents:read/write on
+#   ryyr-ry/Slesty ONLY. (A token is required because `gh release create`
+#   works over the API; deploy keys cannot drive the REST API.)
+#   Scope is the single private repo; it cannot read anything else.
+#
+# CRLF GUARD: secrets created from Windows can carry \r, which breaks ssh
+# key parsing ("error in libcrypto"). The normalize step strips it.
 
 name: Slesty CI (build + test on public runners)
 
@@ -30,8 +42,7 @@ on:
     # Weekly refresh: Monday 03:00 UTC.
     - cron: "0 3 * * 1"
 
-permissions:
-  contents: write # to create releases with binaries
+permissions: {} # nothing in this public repo needs any permission
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,15 +61,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/.ssh"
-          # Diagnose the secret transport: byte count + line count, then
-          # strip CR and re-add the trailing newline ssh keys require.
           printf '%s' "$SLESTY_DEPLOY_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
           printf '\n' >> "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-          wc -c < "$HOME/.ssh/id_ed25519"
-          head -1 "$HOME/.ssh/id_ed25519"
-          tail -1 "$HOME/.ssh/id_ed25519"
-          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > /dev/null || { echo "key parse failed"; exit 1; }
+          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > /dev/null || { echo "read key parse failed"; exit 1; }
           ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
         env:
           SLESTY_DEPLOY_KEY: ${{ secrets.SLESTY_DEPLOY_KEY }}
@@ -66,7 +72,8 @@ jobs:
       - name: Checkout the private source (runtime, read-only deploy key)
         shell: bash
         run: |
-          git clone --depth 1 "git@github.com:${PRIVATE_REPO}.git" slesty
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes" \
+            git clone --depth 1 "git@github.com:${PRIVATE_REPO}.git" slesty
           cd slesty
           git checkout "${{ github.event.inputs.ref || 'main' }}"
 
@@ -96,7 +103,7 @@ jobs:
           if (-not $protoc) { throw "protoc not found after choco install" }
           "PROTOC=$($protoc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Capture the tested commit (for artifact naming)
+      - name: Capture the tested commit (for release asset naming)
         shell: bash
         run: |
           cd slesty
@@ -118,60 +125,41 @@ jobs:
         run: cargo build --release
         working-directory: slesty
 
-      - name: Package binaries (unix)
-        if: runner.os != 'Windows'
+      # ------------------------------------------------------------------
+      # Publish: the binary goes STRAIGHT into the PRIVATE repository.
+      # No artifact upload, no public staging, nothing public on the way.
+      # ------------------------------------------------------------------
+      - name: Publish the binary to the PRIVATE repository's release
+        shell: bash
+        env:
+          SHA: ${{ env.SHA }}
+          GH_TOKEN: ${{ secrets.SLESTY_RELEASE_TOKEN }}
         run: |
-          mkdir -p dist
-          cp slesty/target/release/slesty dist/
-          tar -czf "dist/slesty-${{ runner.os }}-${{ env.SHA }}.tar.gz" -C dist slesty
+          set -euo pipefail
+          REF="${{ github.event.inputs.ref || 'main' }}"
+          OS_TAG=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
+          TAG="ci-${GITHUB_RUN_NUMBER}-${OS_TAG}"
+          BIN="slesty/target/release/slesty"
+          [ -f "$BIN" ] || [ -f "${BIN}.exe" ] || { echo "binary missing"; exit 1; }
+          if [ -f "${BIN}.exe" ]; then
+            mv "${BIN}.exe" "slesty-${OS_TAG}-${SHA}.exe"
+            ASSET="slesty-${OS_TAG}-${SHA}.exe"
+          else
+            cp "$BIN" "slesty-${OS_TAG}-${SHA}"
+            ASSET="slesty-${OS_TAG}-${SHA}"
+          fi
+          echo "Creating private release ${TAG} in ${PRIVATE_REPO}"
+          gh release create "${TAG}" \
+            --repo "${PRIVATE_REPO}" \
+            --target "${REF}" \
+            --title "Slesty CI run ${GITHUB_RUN_NUMBER} - ${RUNNER_OS} (${SHA})" \
+            --notes "Automated build from the public CI harness (${RUNNER_OS}).
 
-      - name: Package binaries (windows)
-        if: runner.os == 'Windows'
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item slesty\target\release\slesty.exe dist\
-          Compress-Archive -Path dist\slesty.exe -DestinationPath "dist/slesty-${{ runner.os }}-${{ env.SHA }}.zip"
+          Commit ${SHA} of ${PRIVATE_REPO}:
+          - rustfmt clean
+          - clippy -D warnings clean
+          - cargo test --workspace green
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: slesty-${{ runner.os }}-${{ env.SHA }}
-          path: dist/*
-          if-no-files-found: error
-
-  release:
-    name: Publish binaries as a public release
-    needs: build-test
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Download all binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: slesty-*-*
-          merge-multiple: false
-          path: artifacts
-
-      - name: Collect packaged archives
-        run: |
-          mkdir -p release
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
-          ls -R release
-
-      - name: Create the public release with binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ci-${{ github.run_number }}
-          name: "Slesty CI build #${{ github.run_number }}"
-          body: |
-            Automated build from the private Slesty repository (public CI).
-
-            Binaries built and tested by the workflow in this repository:
-            - Linux (ubuntu-24.04)
-            - macOS (macos-14)
-            - Windows (windows-2022)
-
-            Test suite: 95 tests, clippy -D warnings clean, rustfmt clean.
-          files: release/*
-          generate_release_notes: false
-
+          PRIVATE release (in the source repository). The public CI repo
+          keeps no binaries." \
+            "$ASSET"
