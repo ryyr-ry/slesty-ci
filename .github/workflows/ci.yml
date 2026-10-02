@@ -50,8 +50,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/.ssh"
+          # Diagnose the secret transport: byte count + line count, then
+          # strip CR and re-add the trailing newline ssh keys require.
           printf '%s' "$SLESTY_DEPLOY_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
+          printf '\n' >> "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
+          wc -c < "$HOME/.ssh/id_ed25519"
+          head -1 "$HOME/.ssh/id_ed25519"
+          tail -1 "$HOME/.ssh/id_ed25519"
           ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > /dev/null || { echo "key parse failed"; exit 1; }
           ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
         env:
