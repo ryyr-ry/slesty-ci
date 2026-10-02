@@ -64,6 +64,7 @@ jobs:
           SLESTY_DEPLOY_KEY: ${{ secrets.SLESTY_DEPLOY_KEY }}
 
       - name: Checkout the private source (runtime, read-only deploy key)
+        shell: bash
         run: |
           git clone --depth 1 "git@github.com:${PRIVATE_REPO}.git" slesty
           cd slesty
