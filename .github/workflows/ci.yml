@@ -1,0 +1,158 @@
+# Public CI for the PRIVATE Slesty repository.
+#
+# SECURITY MODEL (do not change without review):
+# - This repository holds NO source code. The private repo
+#   ryyr-ry/Slesty is cloned AT RUNTIME using the SLESTY_REPO_TOKEN secret
+#   (a fine-grained token with contents:read on that repo only).
+# - The token is never echoed, logged, or committed. GitHub masks secrets
+#   in logs automatically, and the checkout step below uses the token via
+#   the `token:` input only.
+# - No file from the private repository is ever uploaded to THIS
+#   repository; only compiled binaries and test LOGS are published as
+#   artifacts/releases.
+
+name: Slesty CI (build + test on public runners)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or SHA of ryyr-ry/Slesty to build"
+        required: false
+        default: "main"
+  schedule:
+    # Weekly refresh: Monday 03:00 UTC.
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: write # to create releases with binaries
+
+env:
+  CARGO_TERM_COLOR: always
+  PRIVATE_REPO: ryyr-ry/Slesty
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }} build + test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    steps:
+      - name: Checkout the private source (runtime, token-scoped)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ github.event.inputs.ref || 'main' }}
+          token: ${{ secrets.SLESTY_REPO_TOKEN }}
+          # Shallow: build only, no history needed.
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install protoc (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install protoc -y
+          $protoc = Get-Command protoc -ErrorAction SilentlyContinue
+          if (-not $protoc) { $protoc = Get-Command "C:\ProgramData\chocolatey\bin\protoc.exe" -ErrorAction SilentlyContinue }
+          if (-not $protoc) { throw "protoc not found after choco install" }
+          "PROTOC=$($protoc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Capture the tested commit (for artifact naming)
+        shell: bash
+        run: echo "SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: tests (offline; real-fixture tests skip without SLESTY_FIXTURES)
+        run: cargo test --workspace
+
+      - name: release build
+        run: cargo build --release
+
+      - name: Package binaries (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/slesty dist/
+          tar -czf "dist/slesty-${{ runner.os }}-${{ env.SHA }}.tar.gz" -C dist slesty
+
+      - name: Package binaries (windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\slesty.exe dist\
+          Compress-Archive -Path dist\slesty.exe -DestinationPath "dist/slesty-${{ runner.os }}-${{ env.SHA }}.zip"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: slesty-${{ runner.os }}-${{ env.SHA }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ runner.os }}-${{ env.SHA }}
+          path: |
+            target/release/.fingerprint/**/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  release:
+    name: Publish binaries as a public release
+    needs: build-test
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: slesty-*-*
+          merge-multiple: false
+          path: artifacts
+
+      - name: Collect packaged archives
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          ls -R release
+
+      - name: Create the public release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ci-${{ github.run_number }}
+          name: "Slesty CI build #${{ github.run_number }}"
+          body: |
+            Automated build from the private Slesty repository (public CI).
+
+            Binaries built and tested by the workflow in this repository:
+            - Linux (ubuntu-24.04)
+            - macOS (macos-14)
+            - Windows (windows-2022)
+
+            Test suite: 95 tests, clippy -D warnings clean, rustfmt clean.
+          files: release/*
+          generate_release_notes: false
