@@ -11,6 +11,11 @@
 # - No file from the private repository is ever uploaded to THIS
 #   repository; only compiled binaries and test logs are published as
 #   artifacts/releases.
+#
+# CRLF GUARD: secrets piped from Windows can carry \r\n, which breaks
+# ssh key parsing on the runners ("error in libcrypto"). The normalize
+# step below strips CR before the key is used, so the secret round-trips
+# from any OS.
 
 name: Slesty CI (build + test on public runners)
 
@@ -41,14 +46,22 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14, windows-2022]
     steps:
+      - name: Normalize the deploy key (strip any CRLF from the secret)
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.ssh"
+          printf '%s' "$SLESTY_DEPLOY_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > /dev/null || { echo "key parse failed"; exit 1; }
+          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+        env:
+          SLESTY_DEPLOY_KEY: ${{ secrets.SLESTY_DEPLOY_KEY }}
+
       - name: Checkout the private source (runtime, read-only deploy key)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.PRIVATE_REPO }}
-          ref: ${{ github.event.inputs.ref || 'main' }}
-          ssh-key: ${{ secrets.SLESTY_DEPLOY_KEY }}
-          # Shallow: build only, no history needed.
-          fetch-depth: 1
+        run: |
+          git clone --depth 1 "git@github.com:${PRIVATE_REPO}.git" slesty
+          cd slesty
+          git checkout "${{ github.event.inputs.ref || 'main' }}"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,32 +91,38 @@ jobs:
 
       - name: Capture the tested commit (for artifact naming)
         shell: bash
-        run: echo "SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+        run: |
+          cd slesty
+          echo "SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: rustfmt
         run: cargo fmt --all -- --check
+        working-directory: slesty
 
       - name: clippy (-D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: slesty
 
       - name: tests (offline; real-fixture tests skip without SLESTY_FIXTURES)
         run: cargo test --workspace
+        working-directory: slesty
 
       - name: release build
         run: cargo build --release
+        working-directory: slesty
 
       - name: Package binaries (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/slesty dist/
+          cp slesty/target/release/slesty dist/
           tar -czf "dist/slesty-${{ runner.os }}-${{ env.SHA }}.tar.gz" -C dist slesty
 
       - name: Package binaries (windows)
         if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\slesty.exe dist\
+          Copy-Item slesty\target\release\slesty.exe dist\
           Compress-Archive -Path dist\slesty.exe -DestinationPath "dist/slesty-${{ runner.os }}-${{ env.SHA }}.zip"
 
       - name: Upload binary artifact
@@ -148,3 +167,4 @@ jobs:
             Test suite: 95 tests, clippy -D warnings clean, rustfmt clean.
           files: release/*
           generate_release_notes: false
+
