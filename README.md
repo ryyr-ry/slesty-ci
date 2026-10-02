@@ -11,8 +11,10 @@ binaries and test logs for download.
 
 1. A `workflow_dispatch` (manual) or scheduled run starts on a public runner.
 2. The runner clones the **private** `ryyr-ry/Slesty` repository at runtime,
-   authenticating with a fine-grained deploy token stored in this repository's
-   **encrypted GitHub Secrets** (never printed, never committed).
+   authenticating with a **read-only SSH deploy key** stored in this
+   repository's **encrypted GitHub Secrets** (`SLESTY_DEPLOY_KEY`). The key
+   is scoped to that single repository, is read-only (cannot push), and is
+   never printed or committed.
 3. It runs the full pipeline: `cargo fmt --check`, `cargo clippy -D warnings`,
    `cargo test --workspace`, `cargo build --release`.
 4. The runner uploads the release binaries and the complete test logs as
@@ -33,10 +35,12 @@ binaries and test logs for download.
 ## Why a separate public CI repository?
 
 The owner wants CI to run on GitHub's public runner pool while keeping the
-source private. A public repository with a runtime token achieves both:
-the Actions infrastructure is public (visible run history, public artifacts),
-the code is not. The token in Secrets is scoped to `contents:read` on the
-private repository only and is rotated if ever suspected compromised.
+source private. A public repository with a runtime read-only deploy key
+achieves both: the Actions infrastructure is public (visible run history,
+public artifacts), the code is not. The deploy key grants `contents:read`
+on the private repository only — it cannot write, cannot touch any other
+repository, and is revocable from Slesty's Settings → Deploy keys at any
+moment.
 
 ## Triggering
 
