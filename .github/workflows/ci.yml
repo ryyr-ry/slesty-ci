@@ -125,16 +125,19 @@ jobs:
         shell: bash
         run: |
           # Chocolatey is unavailable on windows-11-arm; download the
-          # official protoc release binary (win64 zip works on ARM64 via
-          # x64 emulation; if unavailable, build from source below).
+          # official protoc release zip instead. The win64 binary runs on
+          # ARM64 via x64 emulation.
+          # NOTE: $GITHUB_ENV does NOT expand bash variables - the path
+          # must be fully resolved here or prost sees a literal "$HOME".
           set -euo pipefail
           PB_REL="https://github.com/protocolbuffers/protobuf/releases"
           VERSION="29.3"
           curl -sSL -o protoc.zip "${PB_REL}/download/v${VERSION}/protoc-${VERSION}-win64.zip"
-          mkdir -p "$HOME/protoc/bin"
-          unzip -o protoc.zip -d "$HOME/protoc" > /dev/null
-          "$HOME/protoc/bin/protoc.exe" --version
-          echo "PROTOC=$HOME/protoc/bin/protoc.exe" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/protoc"
+          unzip -o protoc.zip -d "$RUNNER_TEMP/protoc" > /dev/null
+          PROTOC_PATH="$(cygpath -w "$RUNNER_TEMP/protoc/bin/protoc.exe")"
+          "$RUNNER_TEMP/protoc/bin/protoc.exe" --version
+          echo "PROTOC=${PROTOC_PATH}" >> "$GITHUB_ENV"
 
       - name: Capture the tested commit (for release asset naming)
         shell: bash
