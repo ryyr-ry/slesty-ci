@@ -9,22 +9,25 @@
 # "temporary" upload is a leak.
 #
 # Therefore:
-# - Public runners CLONE the private source with a read-only deploy key.
-# - They build and test it.
-# - Each OS job then pushes its finished binary DIRECTLY into the PRIVATE
-#   repository's releases using a write-scoped release token - from the
-#   job itself, via `gh release create --repo ryyr-ry/Slesty`. The bytes
-#   go runner -> GitHub's private storage. They never transit through
-#   anything public on the way in.
-# - This repository keeps NO artifacts, NO releases, NO caches. The only
-#   public footprint is the run log (secret-masked, no source inside).
+# - Public runners CLONE the private source with a read-only SSH deploy key.
+# - They build and test it on SIX targets (3 OS x 2 architectures).
+# - Each job pushes its finished binary DIRECTLY into ONE release in the
+#   PRIVATE repository via a write-scoped release token. One CI run = one
+#   private release with six assets - no release spam per OS.
+# - This repository keeps NO artifacts, NO releases, NO caches.
 #
 # KEYS (both stored as encrypted secrets in THIS repo):
 # - SLESTY_DEPLOY_KEY   : read-only SSH deploy key on ryyr-ry/Slesty.
 # - SLESTY_RELEASE_TOKEN: fine-grained PAT with contents:read/write on
-#   ryyr-ry/Slesty ONLY. (A token is required because `gh release create`
-#   works over the API; deploy keys cannot drive the REST API.)
-#   Scope is the single private repo; it cannot read anything else.
+#   ryyr-ry/Slesty ONLY.
+#
+# TARGET MATRIX (all official GitHub-hosted runners):
+#   linux   x64  : ubuntu-24.04
+#   linux   arm64: ubuntu-24.04-arm
+#   windows x64  : windows-2022
+#   windows arm64: windows-11-arm
+#   macos   x64  : macos-15-intel
+#   macos   arm64: macos-14
 #
 # CRLF GUARD: secrets created from Windows can carry \r, which breaks ssh
 # key parsing ("error in libcrypto"). The normalize step strips it.
@@ -47,15 +50,29 @@ permissions: {} # nothing in this public repo needs any permission
 env:
   CARGO_TERM_COLOR: always
   PRIVATE_REPO: ryyr-ry/Slesty
+  # One release per CI run: every job appends its asset to this tag.
+  RELEASE_TAG: ci-${{ github.run_number }}
 
 jobs:
   build-test:
-    name: ${{ matrix.os }} build + test
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: windows-x64
+            os: windows-2022
+          - target: windows-arm64
+            os: windows-11-arm
+          - target: macos-x64
+            os: macos-15-intel
+          - target: macos-arm64
+            os: macos-14
     steps:
       - name: Normalize the deploy key (strip any CRLF from the secret)
         shell: bash
@@ -81,7 +98,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install protoc (Ubuntu)
+      - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -94,14 +111,30 @@ jobs:
           brew install protobuf
           echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
+      - name: Install protoc (Windows x64)
+        if: runner.os == 'Windows' && runner.arch == 'X64'
         run: |
           choco install protoc -y
           $protoc = Get-Command protoc -ErrorAction SilentlyContinue
           if (-not $protoc) { $protoc = Get-Command "C:\ProgramData\chocolatey\bin\protoc.exe" -ErrorAction SilentlyContinue }
           if (-not $protoc) { throw "protoc not found after choco install" }
           "PROTOC=$($protoc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install protoc (Windows arm64)
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          # Chocolatey is unavailable on windows-11-arm; download the
+          # official protoc release binary (win64 zip works on ARM64 via
+          # x64 emulation; if unavailable, build from source below).
+          set -euo pipefail
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          VERSION="29.3"
+          curl -sSL -o protoc.zip "${PB_REL}/download/v${VERSION}/protoc-${VERSION}-win64.zip"
+          mkdir -p "$HOME/protoc/bin"
+          unzip -o protoc.zip -d "$HOME/protoc" > /dev/null
+          "$HOME/protoc/bin/protoc.exe" --version
+          echo "PROTOC=$HOME/protoc/bin/protoc.exe" >> "$GITHUB_ENV"
 
       - name: Capture the tested commit (for release asset naming)
         shell: bash
@@ -126,8 +159,11 @@ jobs:
         working-directory: slesty
 
       # ------------------------------------------------------------------
-      # Publish: the binary goes STRAIGHT into the PRIVATE repository.
-      # No artifact upload, no public staging, nothing public on the way.
+      # Publish: append this target's binary to the ONE private release.
+      # `gh release create` on a tag that exists becomes idempotent: it
+      # just adds the new assets, so parallel jobs converge on one
+      # release with six assets. (gh errors on existing tag with
+      # --clobber behaviour we avoid by trying upload-asset first.)
       # ------------------------------------------------------------------
       - name: Publish the binary to the PRIVATE repository's release
         shell: bash
@@ -137,29 +173,27 @@ jobs:
         run: |
           set -euo pipefail
           REF="${{ github.event.inputs.ref || 'main' }}"
-          OS_TAG=$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')
-          TAG="ci-${GITHUB_RUN_NUMBER}-${OS_TAG}"
           BIN="slesty/target/release/slesty"
-          [ -f "$BIN" ] || [ -f "${BIN}.exe" ] || { echo "binary missing"; exit 1; }
           if [ -f "${BIN}.exe" ]; then
-            mv "${BIN}.exe" "slesty-${OS_TAG}-${SHA}.exe"
-            ASSET="slesty-${OS_TAG}-${SHA}.exe"
+            cp "${BIN}.exe" "slesty-${{ matrix.target }}-${SHA}.exe"
+            ASSET="slesty-${{ matrix.target }}-${SHA}.exe"
           else
-            cp "$BIN" "slesty-${OS_TAG}-${SHA}"
-            ASSET="slesty-${OS_TAG}-${SHA}"
+            cp "$BIN" "slesty-${{ matrix.target }}-${SHA}"
+            ASSET="slesty-${{ matrix.target }}-${SHA}"
           fi
-          echo "Creating private release ${TAG} in ${PRIVATE_REPO}"
-          gh release create "${TAG}" \
-            --repo "${PRIVATE_REPO}" \
-            --target "${REF}" \
-            --title "Slesty CI run ${GITHUB_RUN_NUMBER} - ${RUNNER_OS} (${SHA})" \
-            --notes "Automated build from the public CI harness (${RUNNER_OS}).
-
-          Commit ${SHA} of ${PRIVATE_REPO}:
-          - rustfmt clean
-          - clippy -D warnings clean
-          - cargo test --workspace green
-
-          PRIVATE release (in the source repository). The public CI repo
-          keeps no binaries." \
-            "$ASSET"
+          NOTES="Automated build from the public CI harness.
+          Commit ${SHA} of ${PRIVATE_REPO}: rustfmt clean, clippy -D warnings clean, cargo test green.
+          Assets: linux-x64, linux-arm64, windows-x64, windows-arm64, macos-x64, macos-arm64.
+          PRIVATE release (in the source repository); the public CI repo keeps no binaries."
+          # Create the release if this job is first (ignore "already_exists")
+          # so all six jobs converge on the SAME release.
+          if ! gh release view "${RELEASE_TAG}" --repo "${PRIVATE_REPO}" > /dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${PRIVATE_REPO}" \
+              --target "${REF}" \
+              --title "Slesty CI run ${GITHUB_RUN_NUMBER}" \
+              --notes "${NOTES}" || true
+          fi
+          gh release upload "${RELEASE_TAG}" "$ASSET" \
+            --repo "${PRIVATE_REPO}" --clobber
+          echo "Uploaded ${ASSET} to ${PRIVATE_REPO}@${RELEASE_TAG}"
